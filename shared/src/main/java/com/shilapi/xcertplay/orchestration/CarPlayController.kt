@@ -49,6 +49,7 @@ import com.shilapi.xcertplay.network.ManualHotspotManager
 import com.shilapi.xcertplay.network.ExistingWifiManager
 import com.shilapi.xcertplay.network.HotspotAddressPolicy
 import com.shilapi.xcertplay.network.HotspotAddressRecovery
+import com.shilapi.xcertplay.network.P2pBandFallback
 import com.shilapi.xcertplay.network.WifiP2pGroupManager
 import com.shilapi.xcertplay.network.WifiScanPause
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
@@ -272,6 +273,9 @@ class CarPlayController(
     private val wirelessFailureReported = AtomicBoolean(false)
     @Volatile private var instantBluetoothLink: InstantBluetoothLink? = null
     @Volatile private var firstTcpWatchdog: FirstTcpWatchdog? = null
+    private val bandFallback by lazy { P2pBandFallback.of(appContext) }
+    /** Frequency of the Wi-Fi Direct group the iPhone was told to join; null for any other hotspot. */
+    @Volatile private var wirelessP2pFrequencyMHz: Int? = null
     @Volatile private var wirelessPublishedAddress: InetAddress? = null
     @Volatile private var wirelessAlternateAddress: InetAddress? = null
     @Volatile private var wirelessAddressRecovery: HotspotAddressRecovery? = null
@@ -1257,6 +1261,7 @@ class CarPlayController(
                         // says whether the iPhone ever reached the Wi-Fi Direct interface.
                         debugLog("wireless startup generation=$generation first TCP timeout neighbours " +
                             P2pNeighborProbe.read())
+                        recordFirstTcpTimeoutForBand()
                         flipWirelessAddressFamily(generation)
                         fail(WirelessStartupException(WirelessStartupFailure.FIRST_TCP_TIMEOUT,
                             "No AirPlay TCP after CarPlay StartSession"), generation)
@@ -1279,6 +1284,8 @@ class CarPlayController(
             if (isStaleWirelessRun(generation)) {
                 return
             }
+            wirelessP2pFrequencyMHz =
+                if (config.wirelessHotspotMode == WirelessHotspotMode.WIFI_P2P) hotspotInfo.frequencyMHz else null
             pauseWifiScans(hotspotInfo.backend)
             val startedHotspot = hotspot
             wirelessConnectionProof.begin(generation) {
@@ -1696,6 +1703,9 @@ class CarPlayController(
                 wirelessDiagnostics?.let {
                     it.sessionActive()
                     it.close()
+                }
+                if (config.wirelessHotspotMode == WirelessHotspotMode.WIFI_P2P) {
+                    bandFallback.onSessionConfirmed(config.wifiP2pPreferredChannel, wirelessP2pFrequencyMHz)
                 }
                 wirelessConnectionProof.activate(generation, session)
                 // Keep wirelessActiveReported false until maybeCompleteWirelessHandoff() closes
@@ -2371,8 +2381,13 @@ class CarPlayController(
             pastOffReport = state == false
         }
         val manager: WirelessHotspotManager = when (hotspotMode) {
-            WirelessHotspotMode.WIFI_P2P -> WifiP2pGroupManager(appContext, ::debugLog,
-                preferredChannel = config.wifiP2pPreferredChannel)
+            WirelessHotspotMode.WIFI_P2P -> {
+                val channel = bandFallback.channelFor(config.wifiP2pPreferredChannel)
+                if (channel != config.wifiP2pPreferredChannel) {
+                    debugLog("Wi-Fi P2P band fallback active: Auto uses 2.4 GHz after repeated 5 GHz first-connection timeouts")
+                }
+                WifiP2pGroupManager(appContext, ::debugLog, preferredChannel = channel)
+            }
             WirelessHotspotMode.LOCAL_ONLY_HOTSPOT -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 LocalOnlyHotspotManager(appContext, ::debugLog)
             } else {
@@ -2733,6 +2748,17 @@ class CarPlayController(
                     !it.equals(ADAPTER_ADDRESS_PLACEHOLDER, ignoreCase = true)
             }
             ?: airPlayConfig.btMac
+    }
+
+    /** A group the iPhone never joined: after repeated timeouts on 5 GHz, Auto moves to 2.4 GHz. */
+    private fun recordFirstTcpTimeoutForBand() {
+        if (config.wirelessHotspotMode != WirelessHotspotMode.WIFI_P2P) return
+        val frequency = wirelessP2pFrequencyMHz
+        val outcome = bandFallback.onFirstTcpTimeout(config.wifiP2pPreferredChannel, frequency)
+        if (outcome != P2pBandFallback.Outcome.UNCHANGED) {
+            debugLog("Wi-Fi P2P band fallback outcome=$outcome groupFrequencyMHz=${frequency ?: "unknown"} " +
+                "timeoutsBeforeFallback=${P2pBandFallback.TIMEOUTS_BEFORE_FALLBACK}")
+        }
     }
 
     private fun flipWirelessAddressFamily(generation: Int) = synchronized(wirelessResourceLock) {
